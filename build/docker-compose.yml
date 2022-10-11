@@ -1,0 +1,58 @@
+version: "3.5"
+services:
+  mysqldb:
+    image: mysql:5.6
+    container_name: "${mysql_host}"
+    restart: always
+    environment:
+      MYSQL_DATABASE: ${dev_portal_database}
+      MYSQL_USER: ${mysql_username}
+      MYSQL_PASSWORD: ${mysql_password}
+      MYSQL_ROOT_PASSWORD: 'password'
+    ports:
+      - '3306:3306'
+    expose:
+      - '3306'
+    healthcheck:
+      test: mysqladmin ping -h localhost
+      interval: 6s
+      timeout: 5s
+      retries: 10
+  portalws:
+    image: "${img_tag_latest}"
+    container_name: 'portalws'
+    ports:
+      - 3000:3000
+    entrypoint: /usr/bin/docker-entrypoint.sh
+    environment:
+      - PORT=${PORT}
+      - mysql_host=${mysql_host}
+      - mysql_username=${mysql_username}
+      - mysql_password=${mysql_password}
+      - AUTHORIZATION_USERNAME=admin
+      - AUTHORIZATION_PASSWORD=testpswd!
+    env_file:
+     - .env
+    depends_on:
+      mysqldb:
+        condition: service_healthy
+    links:
+      - mysqldb
+    healthcheck:
+      test: /usr/bin/portalws-healthcheck.sh
+      interval: 5s
+      timeout: 2s
+      retries: 10
+      start_period: 20s
+  portalws-proxy:
+    image: "${IMAGE_NAME_HTTP_PROXY}"
+    container_name: 'portalws-proxy'
+    ports:
+      - 10000:10000
+    environment:
+      - SERVICE_URI_PREFIX=portalws
+      - SERVICE_PORT=3000
+      - SERVICE_HOST=portalws
+      - SERVICE_HOST_ADDRESS_TYPE=LOGICAL_DNS
+    links:
+      - portalws
