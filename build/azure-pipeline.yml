@@ -1,0 +1,136 @@
+# Change naming convention of build for tagging later below
+name: $(SourceBranchName)_$(date:yyyyMMdd)$(rev:.r)
+
+trigger:
+  branches:
+    include:
+      - unity-bc-master
+  paths:
+    include:
+      - "PortalWebService/*"
+
+# global variables for this pipeline are available in this group
+variables:
+  - group: "UNITYBC-DEV"
+
+parameters:
+  - name: workingDirectory
+    type: string
+    default: $(Build.SourcesDirectory)/PortalWebService
+  - name: vmImage
+    type: string
+    default: "ubuntu-latest"
+  - name: imageRegistry
+    type: string
+    default: $(IMAGE_REGISTRY)
+  - name: ecsServiceName
+    type: string
+    default: "ecssvc-portalws-dd-dev"
+  - name: forceDeploy
+    type: boolean
+    default: false
+    displayName: "Force Deployment Stage to Run"
+
+stages:
+  - stage: Build
+    displayName: "Build Image & Push to [SharedServices] ECR"
+    jobs:
+      - job: "BuildImage"
+        pool: 
+          vmImage: ${{ parameters.vmImage }}
+        steps:
+          # A specific task AWSShellScript@1 had to be used to get the aws ecr command to work correctly
+          # We call this early on so that the pipeline is able to reference base images from ECR
+          - task: AWSShellScript@1
+            name: AwsEcrLogin
+            inputs:
+              awsCredentials:  $(AWS_SERVICE_CONNECTION)
+              scriptType: inline
+              inlineScript: |
+                aws ecr get-login-password | docker login --username AWS --password-stdin ${{ parameters.imageRegistry }}     
+              regionName: $(AWS_REGION)
+
+          # override the BUILD_ID with Build.BuildNumber so that the images are tagged with this variable
+          # the release pipeline will use the BuildNumber to retrieve the image in UAT, PROD 
+          - script: | 
+              make build;
+            displayName: "Build image"
+            workingDirectory: ${{ parameters.workingDirectory }}
+            env:
+              BUILD_ID: $(Build.BuildNumber) 
+
+          - script: | 
+              make portalws-proxy-test;
+            displayName: "Test image"
+            workingDirectory: ${{ parameters.workingDirectory }}
+            env:
+              BUILD_ID: $(Build.BuildNumber) 
+  
+          - script: |
+              make build-push
+            displayName: "Push [DEV] to Container Registry"
+            workingDirectory: ${{ parameters.workingDirectory }}
+            condition: and(succeeded(), ne(variables['Build.Reason'], 'IndividualCI'))
+            env:
+              BUILD_ID: $(Build.BuildNumber)
+
+          - script: |
+              make release-push
+            displayName: "Push [DEV, COMMIT, LATEST] to Container Registry"
+            workingDirectory: ${{ parameters.workingDirectory }}
+            condition: and(succeeded(), eq(variables['Build.Reason'], 'IndividualCI'))
+            env:
+              BUILD_ID: $(Build.BuildNumber)
+
+          # create a tag on this pipeline build that references the branch and git commit
+          # uses the information output from the previous make command
+          - task: PowerShell@2
+            displayName: "Add Build Tag to Pipeline"
+            inputs:
+              targetType: 'inline'
+              script: |
+                Write-Host "##vso[build.addbuildtag]$(Build.BuildNumber)"
+          
+          - task: PublishBuildArtifacts@1
+            inputs:
+              PathtoPublish: ${{ parameters.workingDirectory }}/build.info
+              ArtifactName: drop
+            displayName: "Publish build artifacts"
+
+          - script: |
+              docker logout
+            displayName: "Docker Logout"
+
+  - stage: "Deploy"
+    dependsOn: Build
+    displayName: "Deploy Container to [DEV] AWS ECS"
+    condition: or(eq(${{ parameters.forceDeploy }}, true), and(succeeded(), eq(variables['Build.Reason'], 'IndividualCI')))
+    jobs: 
+      - job: "DeployToECS"
+        steps: 
+         - task: DownloadPipelineArtifact@2
+           inputs:
+             artifactName: drop
+             itemPattern: '**'
+             targetPath: $(Pipeline.Workspace)
+         
+         - task: AWSShellScript@1
+           name: UpdateECS
+           inputs:
+              awsCredentials: $(AWS_SERVICE_CONNECTION)
+              scriptType: inline
+              arguments: ${{ parameters.ecsServiceName }}
+              inlineScript: |
+                set -o nounset # to treat missing parameters as an error
+                service_name=${1?param missing - AWS ECS service name}
+                cluster=$(AWS_ECS_CLUSTER_INT)
+
+                echo "Update ECS Service With Id: " $1
+                echo -----------------------------------------
+                echo - Retrieve task definition -- Skipped
+                echo - Update Image Tag -- Skipped
+                echo - Register new task definition -- Skipped
+
+                echo - Updating Service
+                aws ecs update-service --cluster $cluster --service $service_name --force-new-deployment   
+              regionName: $(AWS_REGION)  
