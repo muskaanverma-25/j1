@@ -1,136 +1,85 @@
-# Reference: https://docs.microsoft.com/en-us/azure/devops/pipelines/tasks/build/visual-studio-build?view=azure-devops
-name: $(SourceBranchName)_$(date:yyyyMMdd)$(rev:.r)
-
 trigger:
-- unity-bc-master
+  branches:
+    include:
+      - unity-bc-master
+  paths:
+    include:
+      - "EconveyancePro/*"
 
 variables:
-- group: UNITYBC-DEV
-- name: "workingDirectory"
-  value: $(Build.SourcesDirectory)
+  - group: "UNITYBC-DEV"
 
+# 1. workingDirectory: Since this folder has multiple images, the workingDirectory is set by the 
+# individual project's pipeline file so Azure DevOps knows which project to build
+# 2. vmImage: The image to use for the pool
+# 5. imageRegistry: the AWS container registry to use. e.g.{aws_account_id}.dkr.ecr.{region}.amazonaws.com
 parameters:
-- name: "BuildConfiguration"
-  default: "Release"
-- name: "BuildPlatform"
-  default: "Any CPU"
-- name : "DebugMode"
-  values:
-    - true
-    - false
-  default: false
+  - name: workingDirectory
+    type: string
+    default: $(Build.SourcesDirectory)/EconveyancePro/build
+  - name: vmImage
+    type: string
+    default: "ubuntu-latest"
+  - name: imageRegistry
+    type: string
+    default: $(IMAGE_REGISTRY)
 
-pool:
-  vmImage: windows-latest
-  demands: 
-  - msbuild
-  - visualstudio
+stages:
+  - stage: Build
+    jobs:
+      - job: "BuildImage"
+        pool: 
+          vmImage: ${{ parameters.vmImage }}
+        steps:
+          # A specific task AWSShellScript@1 had to be used to get the aws ecr command to work correctly
+          # We call this early on so that the pipeline is able to reference base images from ECR
+          - task: AWSShellScript@1
+            name: AwsEcrLogin
+            inputs:
+              awsCredentials: $(AWS_SERVICE_CONNECTION)
+              scriptType: inline
+              inlineScript: |
+                aws ecr get-login-password | docker login --username AWS --password-stdin ${{ parameters.imageRegistry }}     
+              regionName: $(AWS_REGION)
+
+          - script: |
+              echo "Running make build"
+              make build
+            workingDirectory: ${{ parameters.workingDirectory }} 
+            displayName: "Build Image"
+            env:
+              BUILD_ID: $(Build.BuildNumber)
+           
+          - script: |
+              echo "Test EconveyancePro container startup"
+              make econ-test
+            workingDirectory: ${{ parameters.workingDirectory }}
+            displayName: "Test EconveyancePro Image Locally"
+
+          - script: |
+              echo "Test Worklings container startup and rabbitmq queues creation"
+              make ws-test
+            workingDirectory: ${{ parameters.workingDirectory }}
+            displayName: "Test Worklings Image Locally"
+
+          - bash: exit 1
+            displayName: "Fail build if make test fails"
+            condition: eq(variables['Agent.JobStatus'], 'SucceededWithIssues')
   
-steps:
-- task: NuGetCommand@2
-  displayName: "Restore Nuget Packages"
-  inputs:
-    solution: '**\*.sln'
-    command: restore
-    includeNuGetOrg: true
-    includeReferencedProjects: true
+          - script: |
+              make build-push
+            displayName: "Push [Dev] to Container Registry"
+            workingDirectory: ${{ parameters.workingDirectory }}
+            condition: and(succeeded(), ne(variables['Build.Reason'], 'IndividualCI'))
+            env:
+              BUILD_ID: $(Build.BuildNumber)
 
-# manually building this library as the Reports.Web project build
-# task might not be able to build this automatically
-# --------------------
+          - script: |
+              make release-push
+            displayName: "Push [Latest] to Container Registry"
+            workingDirectory: ${{ parameters.workingDirectory }}
+            condition: and(succeeded(), eq(variables['Build.Reason'], 'IndividualCI'))
 
-- task: VSBuild@1
-  displayName: "Build Solution"
-  inputs: 
-    solution: 'ThirdParty\*.sln'
-    configuration: ${{ parameters.BuildConfiguration }}
-    platform: ${{ parameters.BuildPlatform }}
-
-- task: MSBuild@1
-  condition: ne(${{ parameters.DebugMode }}, true)
-  displayName: "Build OneMove.Econveyance.3PL.WebService Library"
-  inputs: 
-    solution: ${{ variables.workingDirectory }}\ThirdParty\OneMove.Econveyance.3PL.WebService\OneMove.Econveyance.ThirdPartyLinks.WebService.csproj
-    configuration: ${{ parameters.BuildConfiguration }}
-    platform: ${{ parameters.BuildPlatform }}
-    msbuildArguments: '/p:DeployOnBuild=true /p:WebPublishMethod=Package /p:PackageAsSingleFile=true /p:SkipInvalidConfigurations=true /p:PackageLocation="$(Build.ArtifactStagingDirectory)\OneMove.EconveyancePro.ThirdPartyInternal.Webservice"'
-
-- task: MSBuild@1
-  condition: ne(${{ parameters.DebugMode }}, true)
-  displayName: "Build OneMove.EconveyancePro.ThirdPartyInternal.Webservice Project"
-  inputs: 
-    solution: ${{ variables.workingDirectory }}\ThirdParty\OneMove.EconveyancePro.ThirdPartyInternal.Webservice\OneMove.EconveyancePro.ThirdPartyInternal.Webservice.csproj
-    configuration: ${{ parameters.BuildConfiguration }}
-    platform: ${{ parameters.BuildPlatform }}
-    msbuildArguments: '/p:DeployOnBuild=true /p:WebPublishMethod=Package /p:PackageAsSingleFile=true /p:SkipInvalidConfigurations=true /p:PackageLocation="$(Build.ArtifactStagingDirectory)\OneMove.EconveyancePro.ThirdPartyInternal.Webservice"'
-    #msbuildArguments:   msbuild /t:publish /p:PublishProfile=<pubxml file> /p:PublishDir="<specific location>"
-#------------------------------------------------------------------------------------
-<<<<<<< HEAD
-<<<<<<< HEAD
-- task: MSBuild@1
-  displayName: "Build Reports.Web"
-  inputs: 
-    solution: ${{ variables.workingDirectory }}\ThirdParty\OneMove.EconveyancePro.ThirdPartyInternal.Webservice\OneMove.EconveyancePro.ThirdPartyInternal.Webservice.Publish.xml
-    configuration: ${{ parameters.BuildConfiguration }}
-    platform: ${{ parameters.BuildPlatform }}
-    #msbuildArguments: '/p:DeployOnBuild=true /p:PublishProfile=FolderProfile /p:OutputPath=$(Build.ArtifactStagingDirectory)ThirdParty\OneMove.EconveyancePro.ThirdPartyInternal.Webservice\'
-    msbuildArguments:   'msbuild /t:publish /p:PublishProfile="${{ variables.workingDirectory }}\ThirdParty\OneMove.EconveyancePro.ThirdPartyInternal.Webservice\PublishProfile.xml" /p:PublishDir="$(Build.ArtifactStagingDirectory)ThirdParty\OneMove.EconveyancePro.ThirdPartyInternal.Webservice\"
-=======
-=======
->>>>>>> 30a1b5c63354fa4c6d17d0a5ed13932b21cc3234
-#- task: MSBuild@1
- # displayName: "Build Reports.Web"
-  #inputs: 
-   # solution: ${{ variables.workingDirectory }}\ThirdParty\OneMove.EconveyancePro.ThirdPartyInternal.Webservice\OneMove.EconveyancePro.ThirdPartyInternal.Webservice.Publish.xml
-    #configuration: ${{ parameters.BuildConfiguration }}
-    #platform: ${{ parameters.BuildPlatform }}
-    #msbuildArguments: '/p:DeployOnBuild=true /p:PublishProfile=FolderProfile /p:OutputPath=$(Build.ArtifactStagingDirectory)ThirdParty\OneMove.EconveyancePro.ThirdPartyInternal.Webservice\'
-
-- task: DotNetCoreCLI@2
-  inputs:
-    command: 'publish'
-    publishWebProjects: true
-    workingDirectory: ${{ variables.workingDirectory }}\ThirdParty\OneMove.EconveyancePro.ThirdPartyInternal.Webservice\
-
-- script: |
-   dir ${{ variables.workingDirectory}}\ThirdParty\OneMove.EconveyancePro.ThirdPartyInternal.Webservice\
-  condition: eq(${{ parameters.DebugMode }}, true)
-#-------------------------------------------------------------------------------------
-# Publish Artifacts
-
-- publish: $(Build.SourcesDirectory)\ThirdParty\NotificationService\bin\Release\
-  artifact: NotificationService
-  displayName: Publish Artifacts NotificationService
-  condition: Succeeded()
-
-- publish: $(Build.SourcesDirectory)\ThirdParty\MQService\bin\Release\
-  artifact: MQService 
-  displayName: Publish Artifacts MQService
-  condition: Succeeded()
-
-- publish: $(Build.SourcesDirectory)\ThirdParty\FCTXMLTOSQL\FCTXMLTOSQL\bin\Release\
-  artifact: FCTXMLTOSQL 
-  displayName: Publish Artifacts FCTXMLTOSQL
-  condition: Succeeded()
-
-- publish: $(Build.SourcesDirectory)\ThirdParty\ThirdPartyService\bin\Release\
-  artifact: ThirdPartyService 
-  displayName: Publish Artifacts ThirdPartyService
-  condition: Succeeded()
-
-- publish: $(Build.SourcesDirectory)\ThirdParty\OneMove.Econveyance.3PL.WebService\
-  artifact: OneMove.Econveyance.3PL.WebService 
-  displayName: Publish Artifacts OneMove.Econveyance.3PL.WebService
-  condition: Succeeded()
-
-- publish: $(Build.SourcesDirectory)\ThirdParty\OneMove.EconveyancePro.ThirdPartyInternal.Webservice\
-  artifact: OneMove.EconveyancePro.ThirdPartyInternal.Webservice 
-  displayName: Publish Artifacts OneMove.EconveyancePro.ThirdPartyInternal.Webservice
-  condition: Succeeded()
-
-- task: PowerShell@2
-  displayName: "Add Build Tags"
-  inputs:
-    targetType: 'inline'
-    script: |
-      Write-Host "##vso[build.addbuildtag]$(Build.BuildNumber)"
+          - script: |
+              docker logout
+            displayName: "Docker Logout"  
